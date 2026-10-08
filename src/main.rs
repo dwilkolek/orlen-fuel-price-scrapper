@@ -1,15 +1,14 @@
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
-    io::{BufRead, Read, Seek, Write},
+    fs::OpenOptions,
+    io::{Read, Write},
     thread,
-    time::{self, Duration},
+    time::Duration,
 };
 
-use chrono::{DateTime, Days, NaiveDate, Utc};
-use reqwest::blocking::{Client, ClientBuilder};
-use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
-use serde::{Deserialize, Deserializer};
+use chrono::{Days, NaiveDate, Utc};
+use reqwest::blocking::Client;
+use serde::Deserialize;
 
 const PRODUCTS_URL: &str = "https://tool.orlen.pl/api/wholesalefuelprices/Products";
 const PRODUCT_PRICES_URL: &str = "https://tool.orlen.pl/api/wholesalefuelprices/ByProduct";
@@ -21,6 +20,7 @@ fn main() {
             || format!("{:?}", req_rep).contains("ConnectionReset")
         {
             log::warn!("Backing off for 5s...");
+            log::debug!("Backing off reason={:?}", req_rep);
             thread::sleep(Duration::from_secs(5));
             req_rep.retryable()
         } else {
@@ -55,7 +55,7 @@ fn get_products(client: &Client) -> Result<Vec<Product>, reqwest::Error> {
         .get(PRODUCTS_URL)
         .send()
         .and_then(|body| body.json::<Vec<Product>>())
-
+    //mock
     // return Ok(serde_json::from_str(&r#"
     // [{"id":41,"name":"Benzyna bezołowiowa - Eurosuper 95","nameEn":"Unleaded Eurosuper 95","symbol":"Pb95"},{"id":42,"name":"Benzyna bezołowiowa - Super Plus 98","nameEn":"Unleaded Super Plus 98","symbol":"Pb98"},{"id":43,"name":"Olej Napędowy Ekodiesel","nameEn":"Ekodiesel diesel oil","symbol":"ONEkodiesel"},{"id":44,"name":"Olej Napędowy Arktyczny 2","nameEn":"Diesel oil Artic grade A2","symbol":"ONArctic2"},{"id":45,"name":"Olej Napędowy Miejski Super","nameEn":"Super urban diesel oil","symbol":"ONSuper"},{"id":46,"name":"Olej Napędowy Grzewczy Ekoterm","nameEn":"Ekoterm fuel oil","symbol":"OnEkoterm"},{"id":47,"name":"BIO 100","nameEn":"BIO 100","symbol":"BIO100"}]
     // "#).unwrap());
@@ -64,14 +64,12 @@ fn get_products(client: &Client) -> Result<Vec<Product>, reqwest::Error> {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct ProductPrice {
-    product_name: String,
+    // product_name: String,
     #[serde(deserialize_with = "deserialize_utc_datetime")]
     effective_date: NaiveDate,
-    #[serde(deserialize_with = "deserialize_utc_datetime")]
-    publish_from: NaiveDate,
+    #[serde(deserialize_with = "deserialize_utc_datetime_maybe")]
+    publish_from: Option<NaiveDate>,
     value: f32,
-    location_name: String,
-    location_symbol: String,
     unit: Option<String>,
 }
 
@@ -84,9 +82,24 @@ where
     NaiveDate::parse_from_str(&value, "%Y-%m-%dT%H:%M:%S").map_err(serde::de::Error::custom)
 }
 
+fn deserialize_utc_datetime_maybe<'de, D>(deserializer: D) -> Result<Option<NaiveDate>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer);
+
+    match value {
+        Err(_err) => Ok(None),
+        Ok(str) => {
+            let date_opt = NaiveDate::parse_from_str(&str, "%Y-%m-%dT%H:%M:%S").ok();
+            Ok(date_opt)
+        }
+    }
+}
+
 fn get_prices(client: &Client, product_id: i32, start_from: &NaiveDate) -> Vec<ProductPrice> {
     if start_from >= &Utc::now().date_naive() {
-        log::info!("Too early to fetch product prices, product id={}", product_id);
+        log::debug!("Product up to date, skipping");
         return vec![];
     }
     let start_from_date = start_from.format("%Y-%m-%d").to_string();
@@ -94,7 +107,7 @@ fn get_prices(client: &Client, product_id: i32, start_from: &NaiveDate) -> Vec<P
         "{}?productId={}&from={}",
         PRODUCT_PRICES_URL, product_id, start_from_date
     );
-    log::info!(
+    log::debug!(
         "Fetching product prices, productId = {}, start_from = {}, url = {}",
         product_id,
         start_from_date,
@@ -106,45 +119,47 @@ fn get_prices(client: &Client, product_id: i32, start_from: &NaiveDate) -> Vec<P
         .and_then(|body| body.json::<Vec<ProductPrice>>())
         .unwrap();
 
-    rows.sort_by(|a,b| a.effective_date.cmp(&b.effective_date));
+    rows.sort_by_key(|product_price| product_price.effective_date);
     rows
 }
 
 fn update_dump_file(client: &Client, products: Vec<Product>) {
-    let path = format!("prices.csv");
-    // let _ = File::create_new(&path);
+    let path = "prices.csv";
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(false)
         .read(true)
-        .open(&path)
+        .open(path)
         .unwrap();
     let mut buff: String = String::new();
     let read_size = file.read_to_string(&mut buff).unwrap();
 
-    let header = "Produkt,Nazwa,Nazwa angielska,Symbol,Data,Opublikowane,Lokalizacja,Symbol Lokalizacji,Cena,Jednostka\n";
+    let header =
+        "Produkt,Nazwa,Nazwa angielska,Symbol,Data obowiązywania,Data publikacji,Cena,Jednostka\n";
     let mut product_last_date_map = HashMap::new();
 
     if read_size == 0 {
         file.write_all(header.as_bytes()).unwrap();
-        log::info!("Wrote CSV header")
+        log::debug!("Wrote CSV header")
     } else {
-        log::info!("Reading last metadata");
+        log::debug!("Reading last metadata");
         let mut first_line_skipped = false;
         for line in buff.lines() {
-            log::info!("Line: {}", line);
+            log::debug!("Line: {}", line);
             if !first_line_skipped {
+                log::debug!("Skipping: {}", line);
                 first_line_skipped = true;
                 continue;
             }
-            if line.len() == 0 {
+            if line.is_empty() {
                 continue;
             }
 
             let cols: Vec<String> = line.split(",").map(|s| s.to_owned()).collect();
-            let effective_date = NaiveDate::parse_from_str(&cols[5], "%Y-%m-%d").unwrap();
+            let effective_date = NaiveDate::parse_from_str(&cols[4], "%Y-%m-%d").unwrap();
             let product_id: i32 = cols[0].parse::<i32>().unwrap();
-            log::info!(
+            log::debug!(
                 "Inserting metadata, id={}, v={}",
                 product_id,
                 effective_date
@@ -153,7 +168,7 @@ fn update_dump_file(client: &Client, products: Vec<Product>) {
             product_last_date_map.insert(product_id, effective_date);
         }
     }
-    let start_from_date_default = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+    let start_from_date_default = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
 
     for product in products {
         let start_from = product_last_date_map
@@ -162,19 +177,26 @@ fn update_dump_file(client: &Client, products: Vec<Product>) {
             .unwrap_or(start_from_date_default);
 
         let prices = get_prices(client, product.id, &start_from);
-        log::info!("Product {} has new {} records", product.id, prices.len());
+        log::info!(
+            "Product {} \"{}\" - {} new records since {}",
+            product.id,
+            product.name,
+            prices.len(),
+            start_from.format("%Y-%m-%d")
+        );
         for price in prices {
             file.write_all(
                 format!(
-                    "{},{},{},{},{},{},{},{},{},{}\n",
+                    "{},{},{},{},{},{},{},{}\n",
                     product.id,
                     product.name,
                     product.name_en,
                     product.symbol,
                     price.effective_date,
-                    price.publish_from,
-                    price.location_name,
-                    price.location_symbol,
+                    price
+                        .publish_from
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .unwrap_or_default(),
                     price.value,
                     price.unit.unwrap_or_default()
                 )
@@ -208,7 +230,7 @@ mod deserialization {
                 }
 
         "#;
-        let actual = serde_json::from_str::<ProductPrice>(given).unwrap();
+        let _actual = serde_json::from_str::<ProductPrice>(given).unwrap();
     }
 
     #[test]
