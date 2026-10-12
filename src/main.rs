@@ -33,12 +33,15 @@ fn main() {
         .build()
         .unwrap();
 
+    log::info!("Fetching products...");
     let products_result = get_products(&client);
     if let Err(err) = products_result {
         log::error!("Failed to get products, reason={err}");
         panic!()
     }
-    update_dump_file(&client, products_result.unwrap());
+    let products = products_result.unwrap();
+    log::info!("Found {} products...", products.len());
+    update_dump_file(&client, products);
 }
 
 #[derive(Deserialize, Debug)]
@@ -107,7 +110,7 @@ fn get_prices(client: &Client, product_id: i32, start_from: &NaiveDate) -> Vec<P
         "{}?productId={}&from={}",
         PRODUCT_PRICES_URL, product_id, start_from_date
     );
-    log::debug!(
+    log::info!(
         "Fetching product prices, productId = {}, start_from = {}, url = {}",
         product_id,
         start_from_date,
